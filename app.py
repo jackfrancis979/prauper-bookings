@@ -40,7 +40,7 @@ NOTIFY_TO = ["emmanuel@prauper.com", "jackfrancis979@gmail.com", "buymoneyent@gm
 STUDIO_ADDRESS = "3914 Fairhill Dr, Houston, TX"
 BRAND_NAME = "Buy Money Studios @ Prauper"
 INTAKE_SHEET_ID = "11blhZ_y_TJ2UBY6eZvaGRFumwaleyyvIvdQsx2QwV8E"
-GOOGLE_TOKEN = Path("/Users/buymoney/.hermes/google_token.json")
+GOOGLE_TOKEN = Path(os.environ.get("GOOGLE_TOKEN_JSON", "/Users/buymoney/.hermes/google_token.json"))
 
 # --- Stripe ---
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
