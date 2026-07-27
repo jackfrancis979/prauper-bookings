@@ -1,57 +1,100 @@
 #!/usr/bin/env python3
 """
-Buy Money Studios @ Prauper — Booking Server (Render Deploy)
+Buy Money Studios @ Prauper — Public Booking Server
+Public booking form + admin dashboard + engineer tracking + Intake Sheet sync.
+
+Usage:
+    python3 prauper_booking_server.py                    # localhost:8088
+    python3 prauper_booking_server.py 8088 0.0.0.0       # public-facing
+
+Data: ~/.hermes/prauper-studios/bookings/bookings.json
+Intake Sheet: 11blhZ_y_TJ2UBY6eZvaGRFumwaleyyvIvdQsx2QwV8E
 """
 
 import json
 import os
+import sys
 import uuid
 import smtplib
 import ssl
 import stripe
-from datetime import datetime
+from datetime import datetime, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- Config (all from env vars) ---
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# --- Config ---
+DATA_DIR = Path("/Users/buymoney/.hermes/prauper-studios/bookings")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+BOOKINGS_FILE = DATA_DIR / "bookings.json"
+ENGINEERS_FILE = DATA_DIR / "engineers.json"
+
 SMTP_USER = "jackfrancis979@gmail.com"
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_PASS_FILE = Path("/Users/buymoney/.config/himalaya/.gmail-pass")
 NOTIFY_TO = ["emmanuel@prauper.com", "jackfrancis979@gmail.com", "buymoneyent@gmail.com"]
+
 STUDIO_ADDRESS = "3914 Fairhill Dr, Houston, TX"
 BRAND_NAME = "Buy Money Studios @ Prauper"
 INTAKE_SHEET_ID = "11blhZ_y_TJ2UBY6eZvaGRFumwaleyyvIvdQsx2QwV8E"
+GOOGLE_TOKEN = Path("/Users/buymoney/.hermes/google_token.json")
 
+# --- Stripe ---
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# --- In-memory bookings (resets on redeploy — move to Sheets for persistence) ---
-BOOKINGS = {"bookings": []}
-ENGINEERS = {"engineers": [
-    {"id": "a1b2c3d4", "name": "MadVylan", "email": "", "phone": ""},
-    {"id": "d200b2f1", "name": "Bro Dini", "email": "trackwhippaz@gmail.com", "phone": "3467771780"}
-]}
+# --- Data Helpers ---
+
+def load_json(path, default):
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_bookings():
+    return load_json(BOOKINGS_FILE, {"bookings": []})
+
+def save_bookings(data):
+    save_json(BOOKINGS_FILE, data)
+
+def load_engineers():
+    return load_json(ENGINEERS_FILE, {"engineers": []})
+
+def save_engineers(data):
+    save_json(ENGINEERS_FILE, data)
+
+def get_smtp_pass():
+    if SMTP_PASS_FILE.exists():
+        return SMTP_PASS_FILE.read_text().strip()
+    return os.environ.get("SMTP_PASS", "")
 
 # --- Google Sheets ---
+
 def get_sheets_service():
+    """Get Google Sheets API service."""
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         from googleapiclient.discovery import build
 
-        token_json = os.environ.get("GOOGLE_TOKEN_JSON", "")
-        if not token_json:
-            return None
-        t = json.loads(token_json)
+        with open(GOOGLE_TOKEN) as f:
+            t = json.load(f)
+
         creds = Credentials(
-            token=t.get("token"), refresh_token=t.get("refresh_token"),
-            token_uri=t.get("token_uri"), client_id=t.get("client_id"),
+            token=t.get("token"),
+            refresh_token=t.get("refresh_token"),
+            token_uri=t.get("token_uri"),
+            client_id=t.get("client_id"),
             client_secret=t.get("client_secret")
         )
         creds.refresh(Request())
@@ -61,12 +104,15 @@ def get_sheets_service():
         return None
 
 def read_intake_sheet():
+    """Read all rows from the Recording Studio Intake sheet."""
     service = get_sheets_service()
     if not service:
         return []
+
     try:
         result = service.spreadsheets().values().get(
-            spreadsheetId=INTAKE_SHEET_ID, range="Sessions!A1:O200"
+            spreadsheetId=INTAKE_SHEET_ID,
+            range="Sessions!A1:O200"
         ).execute()
         rows = result.get("values", [])
         if len(rows) <= 1:
@@ -76,7 +122,9 @@ def read_intake_sheet():
         for row in rows[1:]:
             if not row or not row[0]:
                 continue
-            session = {headers[i]: row[i] if i < len(row) else "" for i, h in enumerate(headers)}
+            session = {}
+            for i, h in enumerate(headers):
+                session[h] = row[i] if i < len(row) else ""
             sessions.append(session)
         return sessions
     except Exception as e:
@@ -84,37 +132,89 @@ def read_intake_sheet():
         return []
 
 def append_to_intake_sheet(row_data):
+    """Append a row to the Intake Sheet."""
     service = get_sheets_service()
     if not service:
         return False
+
     try:
         service.spreadsheets().values().append(
-            spreadsheetId=INTAKE_SHEET_ID, range="Sessions!A:O",
-            valueInputOption="USER_ENTERED", body={"values": [row_data]}
+            spreadsheetId=INTAKE_SHEET_ID,
+            range="Sessions!A:O",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row_data]}
         ).execute()
+        print(f"✅ Appended to Intake Sheet: {row_data[:3]}...")
         return True
     except Exception as e:
         print(f"⚠️  Intake Sheet append failed: {e}")
         return False
 
+def calc_intake_row(booking):
+    """Convert a booking to an Intake Sheet row (A-O)."""
+    date_str = booking["preferred_date"]
+    # Format date as MM/DD/YYYY
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        date_str = d.strftime("%m/%d/%Y")
+    except:
+        pass
+
+    artist = booking["artist_name"]
+    session_type = booking.get("session_type", "Recording")
+    start = booking["start_time"]
+    end = booking.get("end_time", "")
+    hours = booking.get("hours", 0)
+    rate = 60 if "Engineer" in session_type and "No" not in session_type else 60
+    total = booking.get("total_estimate", 0)
+    engineer = booking.get("engineer", artist)
+    eng_pay = round(total * 0.5, 2) if "No Engineer" not in session_type else 0
+    prauper_cut = total - eng_pay
+    stockz_share = round(prauper_cut * 0.5, 2)
+    emmanuel_share = round(prauper_cut * 0.5, 2)
+
+    return [
+        date_str,           # A: Date
+        artist,             # B: Artist/Client
+        session_type,       # C: Session Type
+        start,              # D: Start Time
+        end,                # E: End Time
+        f"{hours:.2f}",     # F: Hours
+        f"${rate:.2f}",     # G: Rate
+        f"${total:.2f}",    # H: Total Paid
+        engineer,           # I: Engineer
+        "",                 # J: Notes
+        f"${eng_pay:.2f}",  # K: Engineer Pay
+        f"${prauper_cut:.2f}",  # L: Prauper Cut
+        f"${stockz_share:.2f}", # M: Stockz Share
+        f"${emmanuel_share:.2f}",# N: Emmanuel Share
+        ""                  # O: Paid
+    ]
+
 # --- Email ---
-def send_email(subject, html_body, plain_body, to_addrs):
-    if not SMTP_PASS:
-        print("⚠️  No SMTP password — email not sent")
+
+def send_email(subject, html_body, plain_body, to_addrs, from_addr=SMTP_USER):
+    password = get_smtp_pass()
+    if not password:
+        print("⚠️  No SMTP password found — email not sent")
         return False
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"Buy Money Studios <{SMTP_USER}>"
+    msg["From"] = f"Buy Money Studios <{from_addr}>"
     msg["To"] = ", ".join(to_addrs)
     msg.attach(MIMEText(plain_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
+
     context = ssl.create_default_context()
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo(); server.starttls(context=context); server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_addrs, msg.as_string())
-        print(f"✅ Email sent: {subject}")
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(from_addr, password)
+            server.sendmail(from_addr, to_addrs, msg.as_string())
+        print(f"✅ Email sent: {subject} → {to_addrs}")
         return True
     except Exception as e:
         print(f"❌ Email failed: {e}")
@@ -122,42 +222,59 @@ def send_email(subject, html_body, plain_body, to_addrs):
 
 def send_booking_notification(booking):
     artist = booking["artist_name"]
+    summary = booking.get("session_summary", "")
+    session_type = booking["session_type"]
+    hours = booking.get("hours", 0)
+    total = booking.get("total_estimate", 0)
+    engineer = booking.get("engineer", "TBD")
+
     subject = f"🎙️ New Booking — {artist}"
-    html = f"""<html><body style="font-family:Arial;max-width:600px;margin:0 auto;padding:20px;">
-<h2>New Booking Request</h2>
+    html = f"""<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+<h2 style="color:#1A1A1A;">New Booking Request</h2>
 <table style="width:100%;border-collapse:collapse;margin:15px 0;">
 <tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Artist</td><td style="padding:8px;border-bottom:1px solid #eee;">{artist}</td></tr>
 <tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Email</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking.get('email','N/A')}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Phone</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking.get('phone','N/A')}</td></tr>
 <tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Date</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking['preferred_date']}</td></tr>
-<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Time</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking.get('session_summary','')}</td></tr>
-<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Type</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking['session_type']}</td></tr>
-<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Total</td><td style="padding:8px;border-bottom:1px solid #eee;">${booking.get('total_estimate',0)}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Time</td><td style="padding:8px;border-bottom:1px solid #eee;">{summary}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Session Type</td><td style="padding:8px;border-bottom:1px solid #eee;">{session_type}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Engineer</td><td style="padding:8px;border-bottom:1px solid #eee;">{engineer}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Est. Total</td><td style="padding:8px;border-bottom:1px solid #eee;">${total}</td></tr>
 </table>
+<p><strong>Project:</strong> {booking.get('project_details','None provided')}</p>
+<p style="margin-top:20px;"><a href="http://localhost:8088/admin" style="background:#1A1A1A;color:white;padding:10px 20px;text-decoration:none;border-radius:4px;">Review in Admin</a></p>
 <p style="color:#666;font-size:12px;">— {BRAND_NAME}</p>
 </body></html>"""
-    plain = f"New Booking: {artist} | {booking['preferred_date']} | {booking.get('session_summary','')} | ${booking.get('total_estimate',0)}"
+    plain = f"New Booking: {artist} | {booking['preferred_date']} | {summary} | {session_type} | Engineer: {engineer} | ${total}"
     return send_email(subject, html, plain, NOTIFY_TO)
 
 def send_confirmation_email(booking):
+    artist = booking["artist_name"]
     email = booking.get("email", "")
     if not email:
         return False
+    summary = booking.get("session_summary", "")
+    total = booking.get("total_estimate", 0)
+
     subject = f"✅ Booking Confirmed — {BRAND_NAME}"
-    html = f"""<html><body style="font-family:Arial;max-width:600px;margin:0 auto;padding:20px;">
+    html = f"""<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
 <h2>Booking Confirmed ✅</h2>
-<p>Hi <strong>{booking['artist_name']}</strong>,</p>
+<p>Hi <strong>{artist}</strong>,</p>
 <p>Your session at <strong>{BRAND_NAME}</strong> is confirmed!</p>
-<p><strong>Date:</strong> {booking['preferred_date']}<br>
-<strong>Time:</strong> {booking.get('session_summary','')}<br>
-<strong>Location:</strong> {STUDIO_ADDRESS}<br>
-<strong>Total:</strong> ${booking.get('total_estimate',0)}</p>
-<p>Remaining balance due at session.</p>
-<p style="color:#666;font-size:12px;">— {BRAND_NAME}</p>
+<table style="width:100%;border-collapse:collapse;margin:15px 0;">
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Date</td><td style="padding:8px;border-bottom:1px solid #eee;">{booking['preferred_date']}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Time</td><td style="padding:8px;border-bottom:1px solid #eee;">{summary}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Location</td><td style="padding:8px;border-bottom:1px solid #eee;">{STUDIO_ADDRESS}</td></tr>
+<tr><td style="padding:8px;font-weight:bold;border-bottom:1px solid #eee;">Total</td><td style="padding:8px;border-bottom:1px solid #eee;">${total}</td></tr>
+</table>
+<p>Invoice will be sent via Shopify.</p>
+<p style="color:#666;font-size:12px;">— {BRAND_NAME} · {STUDIO_ADDRESS}</p>
 </body></html>"""
-    plain = f"Booking Confirmed! {booking['artist_name']} | {booking['preferred_date']} | ${booking.get('total_estimate',0)}"
+    plain = f"Booking Confirmed! {artist} | {booking['preferred_date']} | {summary} | ${total}"
     return send_email(subject, html, plain, [email])
 
 # --- Pricing ---
+
 def calc_hours(start_time, end_time):
     def to_minutes(t):
         parts = t.strip().split()
@@ -182,27 +299,11 @@ def calc_price(session_type, hours):
         return round(base + (hours - 8) * 25, 2)
     return round(hours * 60, 2)
 
-def calc_intake_row(booking):
-    date_str = booking["preferred_date"]
-    try:
-        d = datetime.strptime(date_str, "%Y-%m-%d")
-        date_str = d.strftime("%m/%d/%Y")
-    except: pass
-    hours = booking.get("hours", 0)
-    total = booking.get("total_estimate", 0)
-    eng_pay = round(total * 0.5, 2) if "No Engineer" not in booking.get("session_type", "") else 0
-    prauper_cut = total - eng_pay
-    return [
-        date_str, booking["artist_name"], booking.get("session_type", ""),
-        booking["start_time"], booking.get("end_time", ""), f"{hours:.2f}",
-        f"${60:.2f}", f"${total:.2f}", booking.get("engineer", ""),
-        "", f"${eng_pay:.2f}", f"${prauper_cut:.2f}",
-        f"${round(prauper_cut*0.5,2):.2f}", f"${round(prauper_cut*0.5,2):.2f}", ""
-    ]
 
 # ============================
-# BOOKING FORM HTML
+# PUBLIC BOOKING FORM
 # ============================
+
 BOOKING_FORM_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -288,6 +389,7 @@ BOOKING_FORM_HTML = """
         </div>
       </div>
       <input type="hidden" id="session_type" required>
+
       <div id="engineerSection" style="display:none;margin-top:20px;">
         <label>Select Engineer *</label>
         <select id="engineer" onchange="updatePreview()">
@@ -297,6 +399,7 @@ BOOKING_FORM_HTML = """
           <option value="Let Us Pick">Let Us Pick</option>
         </select>
       </div>
+
       <div class="row" style="margin-top:20px;">
         <div>
           <label>Start Time *</label>
@@ -352,7 +455,7 @@ BOOKING_FORM_HTML = """
           <div class="gear-item"><span class="gear-icon">🎤</span><span class="gear-name">Neumann TLM 103 Condenser Mic</span></div>
           <div class="gear-item"><span class="gear-icon">🎤</span><span class="gear-name">Shure SM7dB Dynamic Vocal Mic</span></div>
           <div class="gear-item"><span class="gear-icon">🎚️</span><span class="gear-name">Universal Audio LA-610 MK2</span></div>
-          <div class="gear-item"><span class="gear-icon">🔊</span><span class="gear-name">KRK S10.4 10\" Subwoofer</span></div>
+          <div class="gear-item"><span class="gear-icon">🔊</span><span class="gear-name">KRK S10.4 10" Subwoofer</span></div>
           <div class="gear-item"><span class="gear-icon">🎧</span><span class="gear-name">Universal Audio Apollo Twin</span></div>
           <div class="gear-item"><span class="gear-icon">🎧</span><span class="gear-name">Audio-Technica ATH-M50x</span></div>
           <div class="gear-item"><span class="gear-icon">📺</span><span class="gear-name">Smart TV + HDMI</span></div>
@@ -371,6 +474,7 @@ BOOKING_FORM_HTML = """
     document.querySelectorAll('.type-card').forEach(c => c.classList.remove('selected'));
     el.classList.add('selected'); selType = t;
     document.getElementById('session_type').value = t;
+    // Show engineer section only for hourly with engineer
     document.getElementById('engineerSection').style.display = t === 'Hourly with Engineer' ? 'block' : 'none';
     updatePreview();
   }
@@ -431,16 +535,19 @@ BOOKING_FORM_HTML = """
       project_details:document.getElementById('project_details').value.trim()
     };
     try {
+      // First try Stripe checkout
       const checkoutRes = await fetch('/api/create-checkout-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
       const checkoutData = await checkoutRes.json();
       if(checkoutData.success && checkoutData.url){
+        // Redirect to Stripe Checkout
         window.location.href = checkoutData.url;
         return;
       }
+      // Fallback: if Stripe not configured, save booking without payment
       const res=await fetch('/api/bookings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
       const r=await res.json();
       if(r.success){
-        document.getElementById('bookingForm').innerHTML='<div style=\"text-align:center;padding:40px 0;\"><div style=\"font-size:3rem;margin-bottom:16px;\">✅</div><h2 style=\"color:#fff;margin-bottom:8px;\">Booking Request Received</h2><p style=\"color:#888;\">Thanks '+data.artist_name+'! We will confirm shortly.</p></div>';
+        document.getElementById('bookingForm').innerHTML='<div style="text-align:center;padding:40px 0;"><div style="font-size:3rem;margin-bottom:16px;">✅</div><h2 style="color:#fff;margin-bottom:8px;">Booking Request Received</h2><p style="color:#888;">Thanks '+data.artist_name+'! We will confirm shortly.</p><p style="color:#666;font-size:0.85rem;margin-top:16px;">Invoice via Shopify after confirmation.</p></div>';
       } else throw new Error(r.error||'Failed');
     } catch(err){ alert('Error: '+err.message); btn.disabled=false; btn.textContent='Pay 50% Deposit & Book'; }
   }
@@ -450,8 +557,9 @@ BOOKING_FORM_HTML = """
 """
 
 # ============================
-# ADMIN DASHBOARD HTML
+# ADMIN DASHBOARD
 # ============================
+
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -483,12 +591,14 @@ ADMIN_HTML = """
   .status-pending { background: #3d2e00; color: #fbbf24; }
   .status-confirmed { background: #003d1a; color: #34d399; }
   .status-declined { background: #3d0000; color: #f87171; }
+  .status-completed { background: #1a1a3d; color: #818cf8; }
   .btn-sm { padding: 5px 12px; border: none; border-radius: 5px; font-size: 0.78rem; font-weight: 600; cursor: pointer; margin-left: 4px; }
   .btn-confirm { background: #22c55e; color: #fff; }
   .btn-decline { background: #ef4444; color: #fff; }
   .btn-sync { background: #3b82f6; color: #fff; }
   .btn-sm:hover { opacity: 0.85; }
   .empty { text-align: center; padding: 50px; color: #555; }
+  /* Engineer styles */
   .eng-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 20px; }
   .eng-card { background: #141414; border: 1px solid #222; border-radius: 10px; padding: 20px; }
   .eng-card h3 { color: #fff; font-size: 1rem; margin-bottom: 10px; display: flex; justify-content: space-between; }
@@ -497,6 +607,8 @@ ADMIN_HTML = """
   .eng-stat .v { color: #fff; font-weight: 600; }
   .eng-stat .v.money { color: #34d399; }
   .eng-stat .v.owed { color: #fbbf24; }
+  .eng-add { background: #1a1a1a; border: 2px dashed #333; border-radius: 10px; padding: 20px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .eng-add:hover { border-color: #555; }
   .section-title { font-size: 1rem; color: #fff; margin-bottom: 14px; font-weight: 600; }
   .sub { color: #666; font-size: 0.8rem; margin-top: 4px; }
   .intake-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
@@ -517,6 +629,7 @@ ADMIN_HTML = """
   <div class="tab" onclick="switchTab('intake',this)">📊 Intake Sheet</div>
 </div>
 <div class="content">
+  <!-- BOOKINGS TAB -->
   <div id="tab-bookings">
     <div class="stats">
       <div class="stat"><div class="num" id="statTotal">0</div><div class="label">Total Bookings</div></div>
@@ -531,6 +644,8 @@ ADMIN_HTML = """
     </div>
     <div id="bookingsList"></div>
   </div>
+
+  <!-- ENGINEERS TAB -->
   <div id="tab-engineers" style="display:none;">
     <div class="section-title">Engineer Earnings <span class="sub">— from Intake Sheet + Bookings</span></div>
     <div class="eng-grid" id="engGrid"></div>
@@ -542,6 +657,8 @@ ADMIN_HTML = """
       <button class="btn-sm btn-confirm" onclick="addEngineer()" style="padding:10px 20px;">+ Add</button>
     </div>
   </div>
+
+  <!-- INTAKE SHEET TAB -->
   <div id="tab-intake" style="display:none;">
     <div class="section-title">Recording Studio Intake <span class="sub">— synced from Google Sheets</span></div>
     <div id="intakeStatus" style="margin-bottom:12px;"></div>
@@ -549,15 +666,17 @@ ADMIN_HTML = """
       <table class="intake-table" id="intakeTable">
         <thead><tr>
           <th>Date</th><th>Artist</th><th>Type</th><th>Start</th><th>End</th><th>Hrs</th>
-          <th>Rate</th><th>Total</th><th>Engineer</th><th>Eng Pay</th><th>Prauper</th><th>Paid</th>
+          <th>Rate</th><th>Total</th><th>Engineer</th><th>Notes</th><th>Eng Pay</th><th>Prauper Cut</th><th>Stockz</th><th>Emmanuel</th><th>Paid</th>
         </tr></thead>
         <tbody id="intakeBody"></tbody>
       </table>
     </div>
   </div>
 </div>
+
 <script>
   let allBookings=[], allEngineers=[], intakeSessions=[], currentFilter='all';
+
   async function loadAll() {
     const [bRes, eRes] = await Promise.all([
       fetch('/api/bookings').then(r=>r.json()),
@@ -567,8 +686,11 @@ ADMIN_HTML = """
     allEngineers = eRes.engineers || [];
     renderBookings(); renderEngineers();
     document.getElementById('totalCount').textContent = allBookings.length + ' booking'+(allBookings.length!==1?'s':'');
+    // Load intake data for engineers tab
     loadIntake();
   }
+
+  // ---- BOOKINGS ----
   function renderBookings() {
     const t=allBookings.length, p=allBookings.filter(b=>b.status==='pending').length;
     const c=allBookings.filter(b=>b.status==='confirmed').length;
@@ -604,21 +726,32 @@ ADMIN_HTML = """
       </div>
     `).join('');
   }
+
   function filterBookings(f, el) {
     currentFilter=f;
     el.parentElement.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    el.classList.add('active'); renderBookings();
+    el.classList.add('active');
+    renderBookings();
   }
+
   async function confirmBooking(id) {
     const b = allBookings.find(x=>x.id===id);
-    if(b) { const eng = prompt('Assign engineer (leave blank for TBD):', b.engineer||''); if(eng!==null) b.engineer=eng; }
+    if(b) {
+      const eng = prompt('Assign engineer (leave blank for TBD):', b.engineer||'');
+      if(eng!==null) b.engineer=eng;
+    }
     await updateBooking(id,'confirmed');
   }
+
   async function updateBooking(id, status) {
     const b = allBookings.find(x=>x.id===id);
-    await fetch('/api/bookings/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,engineer:b?b.engineer:''})});
+    await fetch('/api/bookings/'+id,{
+      method:'PATCH',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({status,engineer:b?b.engineer:''})
+    });
     loadAll();
   }
+
   async function syncToIntake(id) {
     const r = await fetch('/api/bookings/'+id+'/sync',{method:'POST'});
     const d = await r.json();
@@ -626,13 +759,17 @@ ADMIN_HTML = """
     else alert('❌ Sync failed: '+d.error);
     loadAll();
   }
+
   async function deleteBooking(id, name) {
     if(!confirm('Delete booking for ' + name + '? This cannot be undone.')) return;
     await fetch('/api/bookings/'+id,{method:'DELETE'});
     loadAll();
   }
+
+  // ---- ENGINEERS ----
   function renderEngineers() {
     const grid=document.getElementById('engGrid');
+    // Aggregate from intake sheet
     const engMap={};
     intakeSessions.forEach(s=>{
       const name=s['Engineer']||'Unknown';
@@ -642,11 +779,14 @@ ADMIN_HTML = """
       engMap[name].earned+=parseFloat((s['Engineer Pay']||'$0').replace('$',''))||0;
       engMap[name].paid+=(s['Paid']==='✅')?parseFloat((s['Engineer Pay']||'$0').replace('$','')):0;
     });
+    // Also pull from local engineers list
     allEngineers.forEach(e=>{
       if(!engMap[e.name]) engMap[e.name]={name:e.name,email:e.email||'',phone:e.phone||'',sessions:0,hours:0,earned:0,paid:0};
     });
+
     const engs=Object.values(engMap);
     if(!engs.length){grid.innerHTML='<div class="empty">No engineers yet. Add one below.</div>';return;}
+
     grid.innerHTML=engs.map(e=>{
       const owed=e.earned-e.paid;
       return `<div class="eng-card">
@@ -658,15 +798,20 @@ ADMIN_HTML = """
       </div>`;
     }).join('');
   }
+
   async function addEngineer() {
     const name=document.getElementById('engName').value.trim();
     const email=document.getElementById('engEmail').value.trim();
     const phone=document.getElementById('engPhone').value.trim();
     if(!name){alert('Enter a name');return;}
     await fetch('/api/engineers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,phone})});
-    document.getElementById('engName').value='';document.getElementById('engEmail').value='';document.getElementById('engPhone').value='';
+    document.getElementById('engName').value='';
+    document.getElementById('engEmail').value='';
+    document.getElementById('engPhone').value='';
     loadAll();
   }
+
+  // ---- INTAKE SHEET ----
   async function loadIntake() {
     const status=document.getElementById('intakeStatus');
     status.innerHTML='<span style="color:#888;">Loading from Google Sheets...</span>';
@@ -681,10 +826,12 @@ ADMIN_HTML = """
       <td>${s['Date']||''}</td><td>${s['Artist/Client']||''}</td><td>${s['Session Type']||''}</td>
       <td>${s['Start Time']||''}</td><td>${s['End Time']||''}</td><td>${s['Hours']||''}</td>
       <td>${s['Rate ($/hr)']||''}</td><td>${s['Total Paid']||''}</td><td>${s['Engineer']||''}</td>
-      <td>${s['Engineer Pay']||''}</td><td>${s['Prauper Cut']||''}</td><td>${s['Paid']||''}</td>
+      <td>${s['Notes']||''}</td><td>${s['Engineer Pay']||''}</td><td>${s['Prauper Cut']||''}</td>
+      <td>${s['Stockz Share']||''}</td><td>${s['Emmanuel Share']||''}</td><td>${s['Paid']||''}</td>
     </tr>`).join('');
-    renderEngineers();
+    renderEngineers(); // re-render with intake data
   }
+
   function switchTab(tab, el) {
     document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.remove('active'));
     el.classList.add('active');
@@ -692,8 +839,9 @@ ADMIN_HTML = """
       document.getElementById('tab-'+t).style.display=t===tab?'block':'none';
     });
     if(tab==='intake') loadIntake();
-    if(tab==='engineers') loadIntake();
+    if(tab==='engineers') loadIntake(); // refresh engineers with latest intake data
   }
+
   loadAll();
 </script>
 </body>
@@ -714,11 +862,12 @@ def admin():
 
 @app.route("/health")
 def health():
-    return jsonify({"status":"ok","brand":BRAND_NAME,"bookings":len(BOOKINGS["bookings"]),"ts":datetime.now().isoformat()})
+    data = load_bookings()
+    return jsonify({"status":"ok","brand":BRAND_NAME,"bookings":len(data["bookings"]), "ts":datetime.now().isoformat()})
 
 @app.route("/api/bookings", methods=["GET"])
 def list_bookings():
-    return jsonify(BOOKINGS)
+    return jsonify(load_bookings())
 
 @app.route("/api/bookings", methods=["POST"])
 def create_booking():
@@ -727,9 +876,11 @@ def create_booking():
     required = ["artist_name","email","preferred_date","start_time","end_time","session_type"]
     missing = [f for f in required if not body.get(f)]
     if missing: return jsonify({"error":f"Missing: {', '.join(missing)}"}), 400
+
     hours = calc_hours(body["start_time"], body["end_time"])
     if hours <= 0: return jsonify({"error":"End time must be after start time"}), 400
     total = calc_price(body["session_type"], hours)
+
     booking = {
         "id": str(uuid.uuid4())[:8],
         "artist_name": body["artist_name"].strip(),
@@ -750,7 +901,10 @@ def create_booking():
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
     }
-    BOOKINGS["bookings"].append(booking)
+
+    data = load_bookings()
+    data["bookings"].append(booking)
+    save_bookings(data)
     try: send_booking_notification(booking)
     except Exception as e: print(f"⚠️ Email failed: {e}")
     return jsonify({"success":True,"booking":booking}), 201
@@ -759,12 +913,14 @@ def create_booking():
 def update_booking(bid):
     body = request.get_json()
     if not body: return jsonify({"error":"No data"}), 400
-    for b in BOOKINGS["bookings"]:
+    data = load_bookings()
+    for b in data["bookings"]:
         if b["id"]==bid:
             old=b["status"]
             b["status"]=body.get("status",b["status"])
             if "engineer" in body: b["engineer"]=body["engineer"]
             b["updated_at"]=datetime.now().isoformat()
+            save_bookings(data)
             if b["status"]=="confirmed" and old!="confirmed":
                 try: send_confirmation_email(b)
                 except: pass
@@ -773,43 +929,68 @@ def update_booking(bid):
 
 @app.route("/api/bookings/<bid>", methods=["DELETE"])
 def delete_booking(bid):
-    BOOKINGS["bookings"]=[b for b in BOOKINGS["bookings"] if b["id"]!=bid]
+    data = load_bookings()
+    data["bookings"]=[b for b in data["bookings"] if b["id"]!=bid]
+    save_bookings(data)
     return jsonify({"success":True})
 
 @app.route("/api/bookings/<bid>/sync", methods=["POST"])
 def sync_booking_to_intake(bid):
-    for b in BOOKINGS["bookings"]:
+    """Sync a confirmed booking to the Intake Sheet."""
+    data = load_bookings()
+    for b in data["bookings"]:
         if b["id"]==bid:
             row = calc_intake_row(b)
             ok = append_to_intake_sheet(row)
             if ok:
                 b["synced"]=True
                 b["updated_at"]=datetime.now().isoformat()
+                save_bookings(data)
                 return jsonify({"success":True})
             return jsonify({"success":False,"error":"Sheet append failed"}), 500
     return jsonify({"error":"Not found"}), 404
 
 @app.route("/api/engineers", methods=["GET"])
 def list_engineers():
-    return jsonify(ENGINEERS)
+    return jsonify(load_engineers())
 
 @app.route("/api/engineers", methods=["POST"])
 def add_engineer():
     body = request.get_json()
     if not body or not body.get("name"):
         return jsonify({"error":"Name required"}), 400
-    eng = {"id": str(uuid.uuid4())[:8], "name": body["name"].strip(), "email": body.get("email","").strip(), "phone": body.get("phone","").strip()}
-    ENGINEERS["engineers"].append(eng)
+    eng = {
+        "id": str(uuid.uuid4())[:8],
+        "name": body["name"].strip(),
+        "email": body.get("email","").strip(),
+        "phone": body.get("phone","").strip(),
+        "created_at": datetime.now().isoformat()
+    }
+    data = load_engineers()
+    data["engineers"].append(eng)
+    save_engineers(data)
     return jsonify({"success":True,"engineer":eng}), 201
+
+@app.route("/api/engineers/<eid>", methods=["DELETE"])
+def delete_engineer(eid):
+    data = load_engineers()
+    data["engineers"]=[e for e in data["engineers"] if e["id"]!=eid]
+    save_engineers(data)
+    return jsonify({"success":True})
 
 @app.route("/api/intake")
 def get_intake():
+    """Proxy to Google Sheets Intake data."""
     sessions = read_intake_sheet()
     if not sessions:
         return jsonify({"sessions":[],"error":None})
     return jsonify({"sessions":sessions})
 
-# --- Stripe ---
+
+# ============================
+# STRIPE CHECKOUT
+# ============================
+
 CHECKOUT_SUCCESS_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -841,7 +1022,8 @@ CHECKOUT_SUCCESS_HTML = """
     <strong>Next Steps:</strong><br>
     1. Watch your email for the full confirmation<br>
     2. Arrive 15 minutes before your scheduled time<br>
-    3. Bring your laptop (No Engineer sessions — UA drivers required)<br><br>
+    3. Bring your laptop (No Engineer sessions — UA drivers required)<br>
+    <br>
     <strong>Studio:</strong> 3914 Fairhill Dr, Houston, TX
   </div>
   <a href="/" class="btn">Back to Home</a>
@@ -884,32 +1066,47 @@ CHECKOUT_CANCEL_HTML = """
 </html>
 """
 
+
 @app.route("/success")
 def checkout_success():
     return render_template_string(CHECKOUT_SUCCESS_HTML)
+
 
 @app.route("/cancel")
 def checkout_cancel():
     return render_template_string(CHECKOUT_CANCEL_HTML)
 
+
 @app.route("/api/create-checkout-session", methods=["POST"])
 def create_checkout_session():
+    """Create a Stripe Checkout session for the 50% deposit."""
     if not STRIPE_SECRET_KEY:
         return jsonify({"error": "Stripe not configured"}), 500
+
     body = request.get_json()
-    if not body: return jsonify({"error": "No data"}), 400
+    if not body:
+        return jsonify({"error": "No data"}), 400
+
     required = ["artist_name", "email", "preferred_date", "start_time", "end_time", "session_type"]
     missing = [f for f in required if not body.get(f)]
-    if missing: return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+    if missing:
+        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+
     hours = calc_hours(body["start_time"], body["end_time"])
-    if hours <= 0: return jsonify({"error": "End time must be after start time"}), 400
+    if hours <= 0:
+        return jsonify({"error": "End time must be after start time"}), 400
+
     total = calc_price(body["session_type"], hours)
     deposit = round(total * 0.5, 2)
     deposit_cents = int(deposit * 100)
+
+    # Build session summary for Stripe
     summary = body.get("session_summary", "")
     artist = body["artist_name"].strip()
     session_type = body["session_type"]
+
     try:
+        # Determine success/cancel URLs from request
         host_url = request.host_url.rstrip("/")
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -927,14 +1124,20 @@ def create_checkout_session():
                 "quantity": 1,
             }],
             metadata={
-                "artist_name": artist, "email": body.get("email", ""),
-                "phone": body.get("phone", ""), "instagram": body.get("instagram", ""),
-                "preferred_date": body["preferred_date"], "start_time": body["start_time"],
-                "end_time": body["end_time"], "hours": str(hours),
-                "session_type": session_type, "session_summary": summary,
+                "artist_name": artist,
+                "email": body.get("email", ""),
+                "phone": body.get("phone", ""),
+                "instagram": body.get("instagram", ""),
+                "preferred_date": body["preferred_date"],
+                "start_time": body["start_time"],
+                "end_time": body["end_time"],
+                "hours": str(hours),
+                "session_type": session_type,
+                "session_summary": summary,
                 "project_details": body.get("project_details", ""),
                 "engineer": body.get("engineer", ""),
-                "total_estimate": str(total), "deposit": str(deposit),
+                "total_estimate": str(total),
+                "deposit": str(deposit),
             },
             success_url=f"{host_url}/success?session_id={{CHECKOUT_SESSION_ID}}&amount={deposit}",
             cancel_url=f"{host_url}/cancel",
@@ -944,27 +1147,38 @@ def create_checkout_session():
         print(f"❌ Stripe error: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/webhook/stripe", methods=["POST"])
 def stripe_webhook():
+    """Handle Stripe webhook for payment confirmation."""
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
+
     event = None
     if STRIPE_WEBHOOK_SECRET:
         try:
             event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         except stripe.error.SignatureVerificationError as e:
+            print(f"⚠️ Stripe webhook signature failed: {e}")
             return jsonify({"error": "Invalid signature"}), 400
     else:
-        try: event = json.loads(payload)
-        except: return jsonify({"error": "Invalid payload"}), 400
+        # No webhook secret — parse raw event (for dev/testing)
+        try:
+            event = json.loads(payload)
+        except:
+            return jsonify({"error": "Invalid payload"}), 400
 
     if event and event.get("type") == "checkout.session.completed":
-        sd = event["data"]["object"]
-        meta = sd.get("metadata", {})
+        session_data = event["data"]["object"]
+        meta = session_data.get("metadata", {})
+        email = meta.get("email", "")
+        artist = meta.get("artist_name", "Unknown")
+
+        # Create booking record
         booking = {
             "id": str(uuid.uuid4())[:8],
-            "artist_name": meta.get("artist_name", "Unknown"),
-            "email": meta.get("email", ""),
+            "artist_name": artist,
+            "email": email,
             "phone": meta.get("phone", ""),
             "instagram": meta.get("instagram", ""),
             "preferred_date": meta.get("preferred_date", ""),
@@ -977,24 +1191,38 @@ def stripe_webhook():
             "total_estimate": float(meta.get("total_estimate", 0)),
             "engineer": meta.get("engineer", ""),
             "deposit_paid": float(meta.get("deposit", 0)),
-            "stripe_session_id": sd.get("id", ""),
+            "stripe_session_id": session_data.get("id", ""),
             "synced": False,
             "status": "pending",
             "payment": "deposit_paid",
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
-        BOOKINGS["bookings"].append(booking)
-        try: send_booking_notification(booking)
-        except: pass
-        print(f"✅ Stripe payment confirmed — {booking['artist_name']} — deposit ${meta.get('deposit', 0)}")
+
+        data = load_bookings()
+        data["bookings"].append(booking)
+        save_bookings(data)
+
+        # Send notification emails
+        try:
+            send_booking_notification(booking)
+        except Exception as e:
+            print(f"⚠️ Notification email failed: {e}")
+
+        print(f"✅ Stripe payment confirmed — {artist} — deposit ${meta.get('deposit', 0)}")
+
     return jsonify({"received": True})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8088))
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8088
+    host = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
     print(f"🎙️  {BRAND_NAME} Booking Server")
-    stripe_status = "✅ Connected" if STRIPE_SECRET_KEY else "⚠️  Not configured"
-    print(f"   Port:     {port}")
+    stripe_status = "✅ Connected" if STRIPE_SECRET_KEY else "⚠️  Not configured (set STRIPE_SECRET_KEY)"
+    print(f"   Public:   http://{host}:{port}/")
+    print(f"   Admin:    http://{host}:{port}/admin")
+    print(f"   Health:   http://{host}:{port}/health")
+    print(f"   API:      http://{host}:{port}/api/bookings")
     print(f"   Stripe:   {stripe_status}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print()
+    app.run(host=host, port=port, debug=False)
