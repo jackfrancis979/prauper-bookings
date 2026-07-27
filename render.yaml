@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: prauper-bookings
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
+      - key: SMTP_PASS
+        sync: false
